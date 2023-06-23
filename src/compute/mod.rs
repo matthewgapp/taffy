@@ -9,6 +9,7 @@ pub(crate) mod flexbox;
 #[cfg(feature = "grid")]
 pub(crate) mod grid;
 
+use core::cell::RefCell;
 use core::hash::{Hash, Hasher};
 
 use slotmap::DefaultKey;
@@ -144,11 +145,14 @@ fn compute_node_layout(
 
     // First we check if we have a cached result for the given input
     let cache_run_mode = if tree.is_childless(node) { RunMode::PeformLayout } else { run_mode };
+    // if cache_run_mode == RunMode::PeformLayout {
+    increment_cache_stack();
     if let Some(cached_sizes_and_baselines) =
         get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
     {
         return cached_sizes_and_baselines;
     }
+    // }
 
     if let Some(cached_size_and_baselines) =
         compute_from_cache(tree, node, known_dimensions, available_space, cache_run_mode)
@@ -257,6 +261,9 @@ fn compute_node_layout(
     #[cfg(any(feature = "debug", feature = "profile"))]
     NODE_LOGGER.pop_node();
 
+    // if run_mode == RunMode::PeformLayout {
+    decrement_cache_stack();
+    // }
     computed_size_and_baselines
 }
 
@@ -322,6 +329,25 @@ fn compute_cache_slot(known_dimensions: Size<Option<f32>>, available_space: Size
     // Slot 5: Neither known_dimensions were set and we are sizing under a MaxContent or Definite available space constraint
     // Slot 6: Neither known_dimensions were set and we are sizing under a MinContent constraint
     5 + (available_space.width == AvailableSpace::MinContent) as usize
+}
+
+fn increment_cache_stack() {
+    CACHE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        *stack += 1;
+    });
+}
+
+fn decrement_cache_stack() {
+    CACHE_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        *stack -= 1;
+        if *stack == 0 {
+            CACHE.with(|cache| {
+                cache.borrow_mut().clear();
+            });
+        }
+    });
 }
 
 fn get_from_thread_local_cache(
@@ -438,6 +464,7 @@ impl LocalCacheItem {
 }
 
 thread_local! {
+    static CACHE_STACK: RefCell<usize> = RefCell::new(0);
     static CACHE: core::cell::RefCell<std::collections::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(std::collections::HashMap::new());
 }
 
