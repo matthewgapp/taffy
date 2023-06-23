@@ -138,6 +138,7 @@ fn compute_node_layout(
     run_mode: RunMode,
     sizing_mode: SizingMode,
 ) -> SizeAndBaselines {
+    increment_cache_call_stack_frame_count();
     #[cfg(any(feature = "debug", feature = "profile"))]
     NODE_LOGGER.push_node(node);
     #[cfg(feature = "debug")]
@@ -146,10 +147,10 @@ fn compute_node_layout(
     // First we check if we have a cached result for the given input
     let cache_run_mode = if tree.is_childless(node) { RunMode::PeformLayout } else { run_mode };
     // if cache_run_mode == RunMode::PeformLayout {
-    increment_cache_stack();
     if let Some(cached_sizes_and_baselines) =
         get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
     {
+        decrement_cache_call_stack_frame_count();
         return cached_sizes_and_baselines;
     }
     // }
@@ -163,6 +164,7 @@ fn compute_node_layout(
         debug_log_node(known_dimensions, parent_size, available_space, run_mode, sizing_mode);
         #[cfg(any(feature = "debug", feature = "profile"))]
         NODE_LOGGER.pop_node();
+        decrement_cache_call_stack_frame_count();
         return cached_size_and_baselines;
     }
 
@@ -238,16 +240,14 @@ fn compute_node_layout(
         ),
     };
 
-    // cache result into thread local
-    CACHE.with(|cache| {
-        let cache_key = CacheKey::new(node, &known_dimensions, &available_space, &parent_size);
-        cache
-            .borrow_mut()
-            .entry(cache_key)
-            .or_insert_with(|| LocalCacheItem { cached_size_and_baselines: computed_size_and_baselines });
+    // cache short-lived result into thread local
+    // result will only last for the duration of the current layout pass (i.e., until the recursive call stack returns)
+    CALL_STACK_CACHE.with(|cache| {
+        let cache_key = CacheKey::new(&node, &known_dimensions, &available_space, &parent_size);
+        cache.borrow_mut().entry(cache_key).or_insert_with(|| LocalCacheItem::new(computed_size_and_baselines));
     });
 
-    // Cache result
+    // Cache result into user's tree
     let cache_slot = compute_cache_slot(known_dimensions, available_space);
     *tree.cache_mut(node, cache_slot) = Some(Cache {
         known_dimensions,
@@ -261,9 +261,7 @@ fn compute_node_layout(
     #[cfg(any(feature = "debug", feature = "profile"))]
     NODE_LOGGER.pop_node();
 
-    // if run_mode == RunMode::PeformLayout {
-    decrement_cache_stack();
-    // }
+    decrement_cache_call_stack_frame_count();
     computed_size_and_baselines
 }
 
@@ -331,19 +329,22 @@ fn compute_cache_slot(known_dimensions: Size<Option<f32>>, available_space: Size
     5 + (available_space.width == AvailableSpace::MinContent) as usize
 }
 
-fn increment_cache_stack() {
-    CACHE_STACK.with(|stack| {
+/// Together with the `decrement_cache_call_stack_frame_count` function, this function is responsible for clearing the thread local cache
+/// this must be called anytime a recursive call to `compute` is made
+fn increment_cache_call_stack_frame_count() {
+    CACHE_STACK_FRAME_COUNT.with(|stack| {
         let mut stack = stack.borrow_mut();
         *stack += 1;
     });
 }
 
-fn decrement_cache_stack() {
-    CACHE_STACK.with(|stack| {
+/// this must be called anytime a recursive call to `compute` returns
+fn decrement_cache_call_stack_frame_count() {
+    CACHE_STACK_FRAME_COUNT.with(|stack| {
         let mut stack = stack.borrow_mut();
         *stack -= 1;
         if *stack == 0 {
-            CACHE.with(|cache| {
+            CALL_STACK_CACHE.with(|cache| {
                 cache.borrow_mut().clear();
             });
         }
@@ -356,8 +357,8 @@ fn get_from_thread_local_cache(
     known_dimensions: &Size<Option<f32>>,
     available_space: &Size<AvailableSpace>,
 ) -> Option<SizeAndBaselines> {
-    CACHE.with(|cache| {
-        let cache_key = CacheKey::new(*node, known_dimensions, available_space, parent_size);
+    CALL_STACK_CACHE.with(|cache| {
+        let cache_key = CacheKey::new(node, known_dimensions, available_space, parent_size);
         cache.borrow().get(&cache_key).map(|item| item.cached_size_and_baselines)
     })
 }
@@ -406,7 +407,7 @@ impl From<Size<AvailableSpace>> for Size<CachedAvailableSpace> {
     }
 }
 
-impl Hash for Size<Option<u32>> {
+impl Hash for Size<Option<HashableFloat>> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.width.hash(state);
         self.height.hash(state);
@@ -414,43 +415,41 @@ impl Hash for Size<Option<u32>> {
 }
 
 impl Size<Option<f32>> {
-    fn to_cache_variant(&self) -> Size<Option<u32>> {
-        Size {
-            width: self.width.map(|w| (w * 1000000.).round() as u32),
-            height: self.height.map(|h| (h * 1000000.).round() as u32),
-        }
+    fn to_cache_variant(&self) -> Size<Option<HashableFloat>> {
+        Size { width: self.width.map(|w| w.into()), height: self.height.map(|h| h.into()) }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct HashableFloat(u64);
+
+impl From<f32> for HashableFloat {
+    fn from(float: f32) -> Self {
+        // retain precision of 6 decimal places
+        // TODO: is this enough precision? and will this overflow for large numbers?
+        HashableFloat((float * 1000000.).round() as u64)
     }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 struct CacheKey {
     node: DefaultKey,
-    known_dimensions: Size<Option<u32>>,
+    known_dimensions: Size<Option<HashableFloat>>,
     available_space: Size<CachedAvailableSpace>,
-    parent_size: Size<Option<u32>>,
+    parent_size: Size<Option<HashableFloat>>,
 }
 
 impl CacheKey {
     fn new(
-        node: DefaultKey,
+        node: &DefaultKey,
         known_dimensions: &Size<Option<f32>>,
         available_space: &Size<AvailableSpace>,
         parent_size: &Size<Option<f32>>,
     ) -> Self {
         let known_dimensions = known_dimensions.to_cache_variant();
         let parent_size = parent_size.to_cache_variant();
-        Self { node, known_dimensions, available_space: (*available_space).into(), parent_size }
+        Self { node: *node, known_dimensions, available_space: (*available_space).into(), parent_size }
     }
-
-    // fn matches(
-    //     &self,
-    //     known_dimensions: &Size<Option<f32>>,
-    //     available_space: &Size<AvailableSpace>,
-    //     parent_size: &Size<Option<f32>>,
-    // ) -> bool {
-    //     let other_cache_key = Self::new(self.node, known_dimensions, available_space, parent_size);
-    //     self == &other_cache_key
-    // }
 }
 
 struct LocalCacheItem {
@@ -464,8 +463,8 @@ impl LocalCacheItem {
 }
 
 thread_local! {
-    static CACHE_STACK: RefCell<usize> = RefCell::new(0);
-    static CACHE: core::cell::RefCell<std::collections::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(std::collections::HashMap::new());
+    static CACHE_STACK_FRAME_COUNT: RefCell<usize> = RefCell::new(0);
+    static CALL_STACK_CACHE: core::cell::RefCell<std::collections::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Try to get the computation result from the cache.
