@@ -347,7 +347,7 @@ impl Hash for Size<Option<f32>> {
     }
 }
 
-impl Hash for Size<AvailableSpace> {
+impl Hash for Size<CachedAvailableSpace> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.width.hash(state);
         self.height.hash(state);
@@ -381,13 +381,6 @@ impl From<Size<AvailableSpace>> for Size<CachedAvailableSpace> {
 }
 
 impl Hash for Size<Option<u32>> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.width.hash(state);
-        self.height.hash(state);
-    }
-}
-
-impl Hash for Size<CachedAvailableSpace> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.width.hash(state);
         self.height.hash(state);
