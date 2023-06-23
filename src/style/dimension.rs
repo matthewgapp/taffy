@@ -1,5 +1,7 @@
 //! Style types for representing lengths / sizes
 
+use core::hash::{Hash, Hasher};
+
 use crate::geometry::{Rect, Size};
 use crate::style_helpers::{FromPercent, FromPoints, TaffyAuto, TaffyMaxContent, TaffyMinContent, TaffyZero};
 use crate::sys::abs;
@@ -180,6 +182,7 @@ pub enum AvailableSpace {
     /// The amount of space available is indefinite and the node should be laid out under a max-content constraint
     MaxContent,
 }
+
 impl TaffyZero for AvailableSpace {
     const ZERO: Self = Self::Definite(0.0);
 }

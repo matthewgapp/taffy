@@ -9,11 +9,15 @@ pub(crate) mod flexbox;
 #[cfg(feature = "grid")]
 pub(crate) mod grid;
 
+use core::hash::{Hash, Hasher};
+
+use slotmap::DefaultKey;
+
 use crate::data::CACHE_SIZE;
 use crate::error::TaffyError;
 use crate::geometry::{Point, Size};
 use crate::layout::{Cache, Layout, RunMode, SizeAndBaselines, SizingMode};
-use crate::node::{Node, Taffy};
+use crate::node::{self, Node, Taffy};
 use crate::style::{AvailableSpace, Display};
 use crate::sys::round;
 use crate::tree::LayoutTree;
@@ -140,6 +144,12 @@ fn compute_node_layout(
 
     // First we check if we have a cached result for the given input
     let cache_run_mode = if tree.is_childless(node) { RunMode::PeformLayout } else { run_mode };
+    if let Some(cached_sizes_and_baselines) =
+        get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
+    {
+        return cached_sizes_and_baselines;
+    }
+
     if let Some(cached_size_and_baselines) =
         compute_from_cache(tree, node, known_dimensions, available_space, cache_run_mode)
     {
@@ -224,6 +234,15 @@ fn compute_node_layout(
         ),
     };
 
+    // cache result into thread local
+    CACHE.with(|cache| {
+        let cache_key = CacheKey::new(node, &known_dimensions, &available_space, &parent_size);
+        cache
+            .borrow_mut()
+            .entry(cache_key)
+            .or_insert_with(|| LocalCacheItem { cached_size_and_baselines: computed_size_and_baselines });
+    });
+
     // Cache result
     let cache_slot = compute_cache_slot(known_dimensions, available_space);
     *tree.cache_mut(node, cache_slot) = Some(Cache {
@@ -305,6 +324,130 @@ fn compute_cache_slot(known_dimensions: Size<Option<f32>>, available_space: Size
     5 + (available_space.width == AvailableSpace::MinContent) as usize
 }
 
+fn get_from_thread_local_cache(
+    node: &DefaultKey,
+    parent_size: &Size<Option<f32>>,
+    known_dimensions: &Size<Option<f32>>,
+    available_space: &Size<AvailableSpace>,
+) -> Option<SizeAndBaselines> {
+    CACHE.with(|cache| {
+        let cache_key = CacheKey::new(*node, known_dimensions, available_space, parent_size);
+        cache.borrow().get(&cache_key).map(|item| item.cached_size_and_baselines)
+    })
+}
+
+fn is_roughly_equal(a: f32, b: f32) -> bool {
+    (a - b).abs() < 0.0001
+}
+
+impl Hash for Size<Option<f32>> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        ((self.width.unwrap_or(0.) * 1000000.).round() as u32).hash(state);
+        ((self.height.unwrap_or(0.) * 1000000.).round() as u32).hash(state);
+    }
+}
+
+impl Hash for Size<AvailableSpace> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.width.hash(state);
+        self.height.hash(state);
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum CachedAvailableSpace {
+    /// The amount of space available is the specified number of pixels
+    Definite(u32),
+    /// The amount of space available is indefinite and the node should be laid out under a min-content constraint
+    MinContent,
+    /// The amount of space available is indefinite and the node should be laid out under a max-content constraint
+    MaxContent,
+}
+
+impl From<AvailableSpace> for CachedAvailableSpace {
+    fn from(available_space: AvailableSpace) -> Self {
+        match available_space {
+            AvailableSpace::Definite(width) => CachedAvailableSpace::Definite((width * 1000000.).round() as u32),
+            AvailableSpace::MinContent => CachedAvailableSpace::MinContent,
+            AvailableSpace::MaxContent => CachedAvailableSpace::MaxContent,
+        }
+    }
+}
+
+impl From<Size<AvailableSpace>> for Size<CachedAvailableSpace> {
+    fn from(available_space: Size<AvailableSpace>) -> Self {
+        Size { width: available_space.width.into(), height: available_space.height.into() }
+    }
+}
+
+impl Hash for Size<Option<u32>> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.width.hash(state);
+        self.height.hash(state);
+    }
+}
+
+impl Hash for Size<CachedAvailableSpace> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.width.hash(state);
+        self.height.hash(state);
+    }
+}
+
+impl Size<Option<f32>> {
+    fn to_cache_variant(&self) -> Size<Option<u32>> {
+        Size {
+            width: self.width.map(|w| (w * 1000000.).round() as u32),
+            height: self.height.map(|h| (h * 1000000.).round() as u32),
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct CacheKey {
+    node: DefaultKey,
+    known_dimensions: Size<Option<u32>>,
+    available_space: Size<CachedAvailableSpace>,
+    parent_size: Size<Option<u32>>,
+}
+
+impl CacheKey {
+    fn new(
+        node: DefaultKey,
+        known_dimensions: &Size<Option<f32>>,
+        available_space: &Size<AvailableSpace>,
+        parent_size: &Size<Option<f32>>,
+    ) -> Self {
+        let known_dimensions = known_dimensions.to_cache_variant();
+        let parent_size = parent_size.to_cache_variant();
+        Self { node, known_dimensions, available_space: (*available_space).into(), parent_size }
+    }
+
+    // fn matches(
+    //     &self,
+    //     known_dimensions: &Size<Option<f32>>,
+    //     available_space: &Size<AvailableSpace>,
+    //     parent_size: &Size<Option<f32>>,
+    // ) -> bool {
+    //     let other_cache_key = Self::new(self.node, known_dimensions, available_space, parent_size);
+    //     self == &other_cache_key
+    // }
+}
+
+struct LocalCacheItem {
+    cached_size_and_baselines: SizeAndBaselines,
+}
+
+impl LocalCacheItem {
+    fn new(cached_size_and_baselines: SizeAndBaselines) -> Self {
+        Self { cached_size_and_baselines }
+    }
+}
+
+thread_local! {
+    static CACHE: core::cell::RefCell<std::collections::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Try to get the computation result from the cache.
 #[inline]
 fn compute_from_cache(
@@ -317,6 +460,7 @@ fn compute_from_cache(
     for idx in 0..CACHE_SIZE {
         let entry = tree.cache_mut(node, idx);
         if let Some(entry) = entry {
+            // return Some(entry.cached_size_and_baselines);
             // Cached ComputeSize results are not valid if we are running in PerformLayout mode
             if entry.run_mode == RunMode::ComputeSize && run_mode == RunMode::PeformLayout {
                 return None;
