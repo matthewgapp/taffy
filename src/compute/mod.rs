@@ -139,7 +139,6 @@ fn compute_node_layout(
     run_mode: RunMode,
     sizing_mode: SizingMode,
 ) -> SizeAndBaselines {
-    increment_cache_call_stack_frame_count();
     #[cfg(any(feature = "debug", feature = "profile"))]
     NODE_LOGGER.push_node(node);
     #[cfg(feature = "debug")]
@@ -147,14 +146,6 @@ fn compute_node_layout(
 
     // First we check if we have a cached result for the given input
     let cache_run_mode = if tree.is_childless(node) { RunMode::PeformLayout } else { run_mode };
-    // if cache_run_mode == RunMode::PeformLayout {
-    if let Some(cached_sizes_and_baselines) =
-        get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
-    {
-        decrement_cache_call_stack_frame_count();
-        return cached_sizes_and_baselines;
-    }
-    // }
 
     if let Some(cached_size_and_baselines) =
         compute_from_cache(tree, node, known_dimensions, available_space, cache_run_mode)
@@ -165,9 +156,15 @@ fn compute_node_layout(
         debug_log_node(known_dimensions, parent_size, available_space, run_mode, sizing_mode);
         #[cfg(any(feature = "debug", feature = "profile"))]
         NODE_LOGGER.pop_node();
-        decrement_cache_call_stack_frame_count();
         return cached_size_and_baselines;
     }
+
+    if let Some(cached_sizes_and_baselines) =
+        get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
+    {
+        return cached_sizes_and_baselines;
+    }
+    increment_cache_call_stack_frame_count();
 
     #[cfg(feature = "debug")]
     debug_log_node(known_dimensions, parent_size, available_space, run_mode, sizing_mode);
@@ -241,12 +238,8 @@ fn compute_node_layout(
         ),
     };
 
-    // cache short-lived result into thread local
-    // result will only last for the duration of the current layout pass (i.e., until the recursive call stack returns)
-    CALL_STACK_CACHE.with(|cache| {
-        let cache_key = CacheKey::new(&node, &known_dimensions, &available_space, &parent_size);
-        cache.borrow_mut().entry(cache_key).or_insert_with(|| LocalCacheItem::new(computed_size_and_baselines));
-    });
+    store_in_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space, computed_size_and_baselines);
+    decrement_cache_call_stack_frame_count();
 
     // Cache result into user's tree
     let cache_slot = compute_cache_slot(known_dimensions, available_space);
@@ -261,8 +254,6 @@ fn compute_node_layout(
     NODE_LOGGER.labelled_debug_log("RESULT", computed_size_and_baselines.size);
     #[cfg(any(feature = "debug", feature = "profile"))]
     NODE_LOGGER.pop_node();
-
-    decrement_cache_call_stack_frame_count();
     computed_size_and_baselines
 }
 
@@ -352,6 +343,19 @@ fn decrement_cache_call_stack_frame_count() {
     });
 }
 
+fn store_in_thread_local_cache(
+    node: &DefaultKey,
+    parent_size: &Size<Option<f32>>,
+    known_dimensions: &Size<Option<f32>>,
+    available_space: &Size<AvailableSpace>,
+    computed_size_and_baselines: SizeAndBaselines,
+) {
+    CALL_STACK_CACHE.with(|cache| {
+        let cache_key = CacheKey::new(&node, &known_dimensions, &available_space, &parent_size);
+        cache.borrow_mut().entry(cache_key).or_insert_with(|| LocalCacheItem::new(computed_size_and_baselines));
+    });
+}
+
 fn get_from_thread_local_cache(
     node: &DefaultKey,
     parent_size: &Size<Option<f32>>,
@@ -362,10 +366,6 @@ fn get_from_thread_local_cache(
         let cache_key = CacheKey::new(node, known_dimensions, available_space, parent_size);
         cache.borrow().get(&cache_key).map(|item| item.cached_size_and_baselines)
     })
-}
-
-fn is_roughly_equal(a: f32, b: f32) -> bool {
-    (a - b).abs() < 0.0001
 }
 
 impl Hash for Size<Option<f32>> {
@@ -382,7 +382,7 @@ impl Hash for Size<CachedAvailableSpace> {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Debug)]
 enum CachedAvailableSpace {
     /// The amount of space available is the specified number of pixels
     Definite(OrderedFloat<f32>),
@@ -392,10 +392,15 @@ enum CachedAvailableSpace {
     MaxContent,
 }
 
+fn round_to_6dp(value: f32) -> f32 {
+    // (value * 100000.).round() / 100000.
+    value
+}
+
 impl From<AvailableSpace> for CachedAvailableSpace {
     fn from(available_space: AvailableSpace) -> Self {
         match available_space {
-            AvailableSpace::Definite(width) => CachedAvailableSpace::Definite(width.into()),
+            AvailableSpace::Definite(n) => CachedAvailableSpace::Definite(round_to_6dp(n).into()),
             AvailableSpace::MinContent => CachedAvailableSpace::MinContent,
             AvailableSpace::MaxContent => CachedAvailableSpace::MaxContent,
         }
@@ -417,11 +422,11 @@ impl Hash for Size<Option<OrderedFloat<f32>>> {
 
 impl Size<Option<f32>> {
     fn to_cache_variant(&self) -> Size<Option<OrderedFloat<f32>>> {
-        Size { width: self.width.map(|w| w.into()), height: self.height.map(|h| h.into()) }
+        Size { width: self.width.map(|w| round_to_6dp(w).into()), height: self.height.map(|h| round_to_6dp(h).into()) }
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Debug)]
 struct CacheKey {
     node: DefaultKey,
     known_dimensions: Size<Option<OrderedFloat<f32>>>,
@@ -454,7 +459,7 @@ impl LocalCacheItem {
 
 thread_local! {
     static CACHE_STACK_FRAME_COUNT: RefCell<usize> = RefCell::new(0);
-    static CALL_STACK_CACHE: core::cell::RefCell<std::collections::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(std::collections::HashMap::new());
+    static CALL_STACK_CACHE: core::cell::RefCell<hashbrown::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(hashbrown::HashMap::new());
 }
 
 /// Try to get the computation result from the cache.
