@@ -12,6 +12,7 @@ pub(crate) mod grid;
 use core::cell::RefCell;
 use core::hash::{Hash, Hasher};
 
+use ordered_float::OrderedFloat;
 use slotmap::DefaultKey;
 
 use crate::data::CACHE_SIZE;
@@ -384,7 +385,7 @@ impl Hash for Size<CachedAvailableSpace> {
 #[derive(Hash, PartialEq, Eq)]
 enum CachedAvailableSpace {
     /// The amount of space available is the specified number of pixels
-    Definite(u32),
+    Definite(OrderedFloat<f32>),
     /// The amount of space available is indefinite and the node should be laid out under a min-content constraint
     MinContent,
     /// The amount of space available is indefinite and the node should be laid out under a max-content constraint
@@ -394,7 +395,7 @@ enum CachedAvailableSpace {
 impl From<AvailableSpace> for CachedAvailableSpace {
     fn from(available_space: AvailableSpace) -> Self {
         match available_space {
-            AvailableSpace::Definite(width) => CachedAvailableSpace::Definite((width * 1000000.).round() as u32),
+            AvailableSpace::Definite(width) => CachedAvailableSpace::Definite(width.into()),
             AvailableSpace::MinContent => CachedAvailableSpace::MinContent,
             AvailableSpace::MaxContent => CachedAvailableSpace::MaxContent,
         }
@@ -407,7 +408,7 @@ impl From<Size<AvailableSpace>> for Size<CachedAvailableSpace> {
     }
 }
 
-impl Hash for Size<Option<HashableFloat>> {
+impl Hash for Size<Option<OrderedFloat<f32>>> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.width.hash(state);
         self.height.hash(state);
@@ -415,28 +416,17 @@ impl Hash for Size<Option<HashableFloat>> {
 }
 
 impl Size<Option<f32>> {
-    fn to_cache_variant(&self) -> Size<Option<HashableFloat>> {
+    fn to_cache_variant(&self) -> Size<Option<OrderedFloat<f32>>> {
         Size { width: self.width.map(|w| w.into()), height: self.height.map(|h| h.into()) }
-    }
-}
-
-#[derive(Hash, PartialEq, Eq)]
-struct HashableFloat(u64);
-
-impl From<f32> for HashableFloat {
-    fn from(float: f32) -> Self {
-        // retain precision of 6 decimal places
-        // TODO: is this enough precision? and will this overflow for large numbers?
-        HashableFloat((float * 1000000.).round() as u64)
     }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 struct CacheKey {
     node: DefaultKey,
-    known_dimensions: Size<Option<HashableFloat>>,
+    known_dimensions: Size<Option<OrderedFloat<f32>>>,
     available_space: Size<CachedAvailableSpace>,
-    parent_size: Size<Option<HashableFloat>>,
+    parent_size: Size<Option<OrderedFloat<f32>>>,
 }
 
 impl CacheKey {
