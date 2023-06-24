@@ -22,7 +22,7 @@ use crate::layout::{Cache, Layout, RunMode, SizeAndBaselines, SizingMode};
 use crate::node::{self, Node, Taffy};
 use crate::style::{AvailableSpace, Display};
 use crate::sys::round;
-use crate::tree::LayoutTree;
+use crate::tree::{DepthCache, LayoutTree};
 
 #[cfg(feature = "flexbox")]
 use self::flexbox::FlexboxAlgorithm;
@@ -144,6 +144,9 @@ fn compute_node_layout(
     #[cfg(feature = "debug")]
     println!();
 
+    // let depth = EphemeralDepthCache.child_depth(node, tree);
+    // let should_use_depth_cache = depth > 15;
+
     // First we check if we have a cached result for the given input
     let cache_run_mode = if tree.is_childless(node) { RunMode::PeformLayout } else { run_mode };
 
@@ -160,7 +163,7 @@ fn compute_node_layout(
     }
 
     if let Some(cached_sizes_and_baselines) =
-        get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space)
+        get_from_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space, run_mode, sizing_mode)
     {
         return cached_sizes_and_baselines;
     }
@@ -238,7 +241,15 @@ fn compute_node_layout(
         ),
     };
 
-    store_in_thread_local_cache(&node, &parent_size, &known_dimensions, &available_space, computed_size_and_baselines);
+    store_in_thread_local_cache(
+        &node,
+        &parent_size,
+        &known_dimensions,
+        &available_space,
+        computed_size_and_baselines,
+        run_mode,
+        sizing_mode,
+    );
     decrement_cache_call_stack_frame_count();
 
     // Cache result into user's tree
@@ -321,6 +332,24 @@ fn compute_cache_slot(known_dimensions: Size<Option<f32>>, available_space: Size
     5 + (available_space.width == AvailableSpace::MinContent) as usize
 }
 
+struct EphemeralDepthCache;
+
+impl DepthCache for EphemeralDepthCache {
+    fn set_depth(&mut self, node: &Node, depth: usize) {
+        CHILD_DEPTH_CACHE.with(|cache| {
+            cache.borrow_mut().insert(*node, depth);
+        })
+    }
+
+    fn depth(&self, node: &Node) -> Option<usize> {
+        CHILD_DEPTH_CACHE.with(|cache| cache.borrow().get(node).copied())
+    }
+
+    fn clear(&mut self) {
+        CHILD_DEPTH_CACHE.with(|cache| cache.borrow_mut().clear());
+    }
+}
+
 /// Together with the `decrement_cache_call_stack_frame_count` function, this function is responsible for clearing the thread local cache
 /// this must be called anytime a recursive call to `compute` is made
 fn increment_cache_call_stack_frame_count() {
@@ -339,6 +368,7 @@ fn decrement_cache_call_stack_frame_count() {
             CALL_STACK_CACHE.with(|cache| {
                 cache.borrow_mut().clear();
             });
+            set_should_use_cache(false);
         }
     });
 }
@@ -349,9 +379,18 @@ fn store_in_thread_local_cache(
     known_dimensions: &Size<Option<f32>>,
     available_space: &Size<AvailableSpace>,
     computed_size_and_baselines: SizeAndBaselines,
+    run_mode: RunMode,
+    sizing_mode: SizingMode,
 ) {
+    if !should_use_cache() {
+        return;
+    }
     CALL_STACK_CACHE.with(|cache| {
-        let cache_key = CacheKey::new(&node, &known_dimensions, &available_space, &parent_size);
+        // if cache.borrow().is_empty() {
+        //     let depth = EphemeralDepthCache.child_depth(*node, tree);
+        //     cache.borrow_mut().reserve(depth * depth);
+        // }
+        let cache_key = CacheKey::new(&node, &known_dimensions, &available_space, &parent_size, run_mode, sizing_mode);
         cache.borrow_mut().entry(cache_key).or_insert_with(|| LocalCacheItem::new(computed_size_and_baselines));
     });
 }
@@ -361,9 +400,14 @@ fn get_from_thread_local_cache(
     parent_size: &Size<Option<f32>>,
     known_dimensions: &Size<Option<f32>>,
     available_space: &Size<AvailableSpace>,
+    run_mode: RunMode,
+    sizing_mode: SizingMode,
 ) -> Option<SizeAndBaselines> {
+    if !should_use_cache() {
+        return None;
+    }
     CALL_STACK_CACHE.with(|cache| {
-        let cache_key = CacheKey::new(node, known_dimensions, available_space, parent_size);
+        let cache_key = CacheKey::new(node, known_dimensions, available_space, parent_size, run_mode, sizing_mode);
         cache.borrow().get(&cache_key).map(|item| item.cached_size_and_baselines)
     })
 }
@@ -432,6 +476,8 @@ struct CacheKey {
     known_dimensions: Size<Option<OrderedFloat<f32>>>,
     available_space: Size<CachedAvailableSpace>,
     parent_size: Size<Option<OrderedFloat<f32>>>,
+    run_mode: RunMode,
+    sizing_mode: SizingMode,
 }
 
 impl CacheKey {
@@ -440,10 +486,19 @@ impl CacheKey {
         known_dimensions: &Size<Option<f32>>,
         available_space: &Size<AvailableSpace>,
         parent_size: &Size<Option<f32>>,
+        run_mode: RunMode,
+        sizing_mode: SizingMode,
     ) -> Self {
         let known_dimensions = known_dimensions.to_cache_variant();
         let parent_size = parent_size.to_cache_variant();
-        Self { node: *node, known_dimensions, available_space: (*available_space).into(), parent_size }
+        Self {
+            node: *node,
+            known_dimensions,
+            available_space: (*available_space).into(),
+            parent_size,
+            run_mode,
+            sizing_mode,
+        }
     }
 }
 
@@ -457,8 +512,22 @@ impl LocalCacheItem {
     }
 }
 
+/// call this when you know the algorithm is recursive
+pub fn set_should_use_cache(should_use_cache: bool) {
+    SHOULD_USE_CACHE.with(|cache| {
+        *cache.borrow_mut() = should_use_cache;
+    });
+}
+
+fn should_use_cache() -> bool {
+    SHOULD_USE_CACHE.with(|cache| *cache.borrow())
+}
+
 thread_local! {
+    static SHOULD_USE_CACHE: RefCell<bool> = RefCell::new(false);
+    static CHILD_DEPTH_CACHE: RefCell<hashbrown::HashMap<Node, usize>> = RefCell::new(hashbrown::HashMap::new());
     static CACHE_STACK_FRAME_COUNT: RefCell<usize> = RefCell::new(0);
+    static NODE_CHILD_DEPTH: RefCell<hashbrown::HashMap<Node, usize>> = RefCell::new(hashbrown::HashMap::new());
     static CALL_STACK_CACHE: core::cell::RefCell<hashbrown::HashMap<CacheKey, LocalCacheItem>>  = core::cell::RefCell::new(hashbrown::HashMap::new());
 }
 

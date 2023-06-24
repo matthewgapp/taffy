@@ -64,3 +64,36 @@ pub trait LayoutTree {
     /// Get a cache entry for this Node by index
     fn cache_mut(&mut self, node: Node, index: usize) -> &mut Option<Cache>;
 }
+
+pub(crate) trait DepthCache {
+    fn depth(&self, node: &Node) -> Option<usize>;
+    // this needs to ensure that the depth is only set if it exceeds the current depth
+    fn set_depth(&mut self, node: &Node, depth: usize);
+    fn clear(&mut self);
+
+    fn child_depth(&mut self, node: Node, tree: &impl LayoutTree) -> usize {
+        // we assume that child_depth is called from the top down, so it's safe to assume that any further calculations would result in depths that are shallower than the current depth
+        if let Some(depth) = self.depth(&node) {
+            return depth;
+        }
+        self.dfs_node_depth(&node, 0, tree)
+    }
+
+    fn dfs_node_depth(&mut self, node: &Node, starting_depth: usize, tree: &impl LayoutTree) -> usize {
+        let mut ending_depth = starting_depth;
+        for child in tree.children(*node) {
+            let child_depth = if let Some(depth) = self.depth(node) {
+                depth
+            } else {
+                let depth = self.dfs_node_depth(child, starting_depth + 1, tree);
+                depth
+            };
+
+            if child_depth > ending_depth {
+                ending_depth = child_depth;
+            }
+        }
+        self.set_depth(node, ending_depth - starting_depth);
+        ending_depth
+    }
+}

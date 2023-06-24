@@ -27,6 +27,8 @@ use crate::tree::LayoutTree;
 #[cfg(feature = "debug")]
 use crate::debug::NODE_LOGGER;
 
+use super::set_should_use_cache;
+
 thread_local! {
 
 static COMPUTE_COUNT: Lazy<std::rc::Rc<std::cell::RefCell<HashMap<DefaultKey, usize>>>> =
@@ -269,6 +271,7 @@ fn compute_preliminary(
     //     DETERMINE_BASE_SIZE.with(|nodes| nodes.borrow_mut().insert(node));
     // }
 
+    // this recurses if case C, D, or E are hit
     determine_flex_base_size(tree, &constants, available_space, &mut flex_items);
     // println!("nodes.len after: {}", DETERMINE_BASE_SIZE.with(|nodes| nodes.borrow().len()));
 
@@ -324,6 +327,7 @@ fn compute_preliminary(
     #[cfg(feature = "debug")]
     NODE_LOGGER.log("determine_hypothetical_cross_size");
     for line in &mut flex_lines {
+        // this will recurse if the one of the line's items cross size cannot be trivially determined
         determine_hypothetical_cross_size(tree, line, &constants, available_space);
     }
 
@@ -331,6 +335,7 @@ fn compute_preliminary(
     // if they are necessary.
     #[cfg(feature = "debug")]
     NODE_LOGGER.log("calculate_children_base_lines");
+    // will recurse if flex-row and one of the flex lines has children are set to participate in baseline alignment
     calculate_children_base_lines(tree, known_dimensions, available_space, &mut flex_lines, &constants);
 
     // 8. Calculate the cross size of each flex line.
@@ -396,11 +401,13 @@ fn compute_preliminary(
     // Do a final layout pass and gather the resulting layouts
     #[cfg(feature = "debug")]
     NODE_LOGGER.log("final_layout_pass");
+    // will always recurse to perform layout on children
     final_layout_pass(tree, node, &mut flex_lines, &constants);
 
     // Before returning we perform absolute layout on all absolutely positioned children
     #[cfg(feature = "debug")]
     NODE_LOGGER.log("perform_absolute_layout_on_absolute_children");
+    // will recurse with size set to definite if any of the children have display absolute set
     perform_absolute_layout_on_absolute_children(tree, node, &constants);
 
     #[cfg(feature = "debug")]
@@ -693,6 +700,8 @@ fn determine_flex_base_size(
                 }
                 ckd
             };
+
+            set_should_use_cache(true);
 
             break 'flex_basis GenericAlgorithm::measure_size(
                 tree,
@@ -1256,6 +1265,7 @@ fn determine_hypothetical_cross_size(
             .maybe_max(padding_border_sum);
 
         let child_inner_cross = child_cross.unwrap_or_else(|| {
+            set_should_use_cache(true);
             GenericAlgorithm::measure_size(
                 tree,
                 child.node,
