@@ -1,12 +1,9 @@
 //! Computes the [flexbox](https://css-tricks.com/snippets/css/a-guide-to-flexbox/) layout algorithm on [`Taffy`](crate::Taffy) according to the [spec](https://www.w3.org/TR/css-flexbox-1/)
 use core::cell::RefCell;
 use core::f32;
-use core::ops::{Add, AddAssign};
 use std::collections::{HashMap, HashSet};
 
-use once_cell::sync::Lazy;
-use slotmap::DefaultKey;
-
+use super::set_should_use_cache;
 use crate::compute::common::alignment::compute_alignment_offset;
 use crate::compute::{GenericAlgorithm, LayoutAlgorithm};
 use crate::geometry::{Point, Rect, Size};
@@ -26,15 +23,6 @@ use crate::tree::LayoutTree;
 
 #[cfg(feature = "debug")]
 use crate::debug::NODE_LOGGER;
-
-use super::set_should_use_cache;
-
-thread_local! {
-
-static COMPUTE_COUNT: Lazy<std::rc::Rc<std::cell::RefCell<HashMap<DefaultKey, usize>>>> =
-    Lazy::new(|| std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())));
-
-}
 
 /// The public interface to Taffy's Flexbox algorithm implementation
 pub(crate) struct FlexboxAlgorithm;
@@ -226,11 +214,6 @@ pub fn compute(
     compute_preliminary(tree, node, styled_based_known_dimensions, parent_size, available_space, run_mode)
 }
 
-thread_local! {
-    static COMPUTE_PRELIMINARY_CACHE: RefCell<HashMap<Node, SizeAndBaselines>> = RefCell::new(HashMap::new());
-    static DETERMINE_BASE_SIZE: RefCell<HashSet<Node>> = RefCell::new(HashSet::new());
-}
-
 /// Compute a preliminary size for an item
 fn compute_preliminary(
     tree: &mut impl LayoutTree,
@@ -263,17 +246,9 @@ fn compute_preliminary(
     // 3. Determine the flex base size and hypothetical main size of each item.
     #[cfg(feature = "debug")]
     NODE_LOGGER.log("determine_flex_base_size");
-    // if DETERMINE_BASE_SIZE.with(|nodes| {
-    //     println!("nodes.len(): {}", nodes.borrow().len());
-    //     nodes.borrow().get(&node).is_none()
-    // }) {
-    //     determine_flex_base_size(tree, &constants, available_space, &mut flex_items);
-    //     DETERMINE_BASE_SIZE.with(|nodes| nodes.borrow_mut().insert(node));
-    // }
 
     // this recurses if case C, D, or E are hit
     determine_flex_base_size(tree, &constants, available_space, &mut flex_items);
-    // println!("nodes.len after: {}", DETERMINE_BASE_SIZE.with(|nodes| nodes.borrow().len()));
 
     #[cfg(feature = "debug")]
     for item in flex_items.iter() {
@@ -444,12 +419,7 @@ fn compute_preliminary(
             })
     };
 
-    let result = SizeAndBaselines {
-        size: constants.container_size,
-        first_baselines: Point { x: None, y: first_vertical_baseline },
-    };
-
-    result
+    SizeAndBaselines { size: constants.container_size, first_baselines: Point { x: None, y: first_vertical_baseline } }
 }
 
 /// Compute constants that can be reused during the flexbox algorithm.
@@ -1266,6 +1236,7 @@ fn determine_hypothetical_cross_size(
 
         let child_inner_cross = child_cross.unwrap_or_else(|| {
             set_should_use_cache(true);
+
             GenericAlgorithm::measure_size(
                 tree,
                 child.node,
@@ -1743,10 +1714,6 @@ fn align_flex_lines_per_align_content(flex_lines: &mut [FlexLine], constants: &A
         flex_lines.iter_mut().enumerate().for_each(align_line);
     }
 }
-
-// thread_local! {
-//     static FLEX_ITEM_CALCULATED
-// }
 
 /// Calculates the layout for a flex-item
 #[allow(clippy::too_many_arguments)]
