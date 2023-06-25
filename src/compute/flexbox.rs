@@ -3,7 +3,6 @@ use core::cell::RefCell;
 use core::f32;
 use std::collections::{HashMap, HashSet};
 
-use super::set_should_use_cache;
 use crate::compute::common::alignment::compute_alignment_offset;
 use crate::compute::{GenericAlgorithm, LayoutAlgorithm};
 use crate::geometry::{Point, Rect, Size};
@@ -23,6 +22,8 @@ use crate::tree::LayoutTree;
 
 #[cfg(feature = "debug")]
 use crate::debug::NODE_LOGGER;
+
+use super::common::StackFrameCache;
 
 /// The public interface to Taffy's Flexbox algorithm implementation
 pub(crate) struct FlexboxAlgorithm;
@@ -671,7 +672,7 @@ fn determine_flex_base_size(
                 ckd
             };
 
-            set_should_use_cache(true);
+            StackFrameCache::set_should_use(true);
 
             break 'flex_basis GenericAlgorithm::measure_size(
                 tree,
@@ -1235,7 +1236,7 @@ fn determine_hypothetical_cross_size(
             .maybe_max(padding_border_sum);
 
         let child_inner_cross = child_cross.unwrap_or_else(|| {
-            set_should_use_cache(true);
+            StackFrameCache::set_should_use(true);
 
             GenericAlgorithm::measure_size(
                 tree,
